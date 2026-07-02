@@ -1,0 +1,11 @@
+.git
+.github
+.idea
+.vscode
+**/target
+**/node_modules
+front
+*.zip
+*.log
+.env
+.env.*

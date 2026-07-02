@@ -1,0 +1,186 @@
+name: CI/CD Lightsail
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: elecciones-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend-test:
+    name: Backend · compilar y probar
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+          cache-dependency-path: |
+            pom.xml
+            commons/pom.xml
+            back/pom.xml
+
+      - name: Maven verify
+        run: mvn -B -ntp clean verify
+
+  frontend-test:
+    name: Frontend · compilar y probar
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: front
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Node 22
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: front/package-lock.json
+
+      - name: Instalar dependencias
+        run: npm ci --no-audit --no-fund
+
+      - name: Pruebas
+        run: npm test -- --watch=false
+
+      - name: Build de producción
+        run: npm run build
+
+  publish-images:
+    name: Publicar imágenes en GHCR
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [backend-test, frontend-test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      backend_image: ${{ steps.images.outputs.backend_image }}
+      frontend_image: ${{ steps.images.outputs.frontend_image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Definir nombres y etiquetas
+        id: images
+        shell: bash
+        run: |
+          repo="$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          short_sha="${GITHUB_SHA::12}"
+          backend="ghcr.io/${repo}-backend"
+          frontend="ghcr.io/${repo}-frontend"
+          echo "backend_repo=$backend" >> "$GITHUB_OUTPUT"
+          echo "frontend_repo=$frontend" >> "$GITHUB_OUTPUT"
+          echo "backend_image=${backend}:sha-${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "frontend_image=${frontend}:sha-${short_sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Login en GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configurar Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Construir y publicar backend
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile.backend
+          push: true
+          tags: |
+            ${{ steps.images.outputs.backend_image }}
+            ${{ steps.images.outputs.backend_repo }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+          provenance: mode=max
+          sbom: true
+
+      - name: Construir y publicar frontend
+        uses: docker/build-push-action@v7
+        with:
+          context: ./front
+          file: ./front/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.images.outputs.frontend_image }}
+            ${{ steps.images.outputs.frontend_repo }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,mode=max,scope=frontend
+          provenance: mode=max
+          sbom: true
+
+  deploy-production:
+    name: Desplegar en Lightsail
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: publish-images
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Configurar SSH
+        env:
+          SSH_KEY: ${{ secrets.LIGHTSAIL_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.LIGHTSAIL_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/lightsail
+          chmod 600 ~/.ssh/lightsail
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Copiar archivos de despliegue
+        env:
+          HOST: ${{ secrets.LIGHTSAIL_HOST }}
+          USER: ${{ secrets.LIGHTSAIL_USER }}
+        run: |
+          ssh -i ~/.ssh/lightsail "$USER@$HOST" 'mkdir -p /opt/elecciones'
+          scp -i ~/.ssh/lightsail deploy/compose.prod.yml deploy/deploy.sh "$USER@$HOST:/opt/elecciones/"
+
+      - name: Login de Lightsail en GHCR privado (opcional)
+        env:
+          HOST: ${{ secrets.LIGHTSAIL_HOST }}
+          USER: ${{ secrets.LIGHTSAIL_USER }}
+          GHCR_USER: ${{ secrets.GHCR_USERNAME }}
+          GHCR_TOKEN: ${{ secrets.GHCR_READ_TOKEN }}
+        run: |
+          if [[ -n "$GHCR_TOKEN" ]]; then
+            printf '%s' "$GHCR_TOKEN" | \
+              ssh -i ~/.ssh/lightsail "$USER@$HOST" \
+              "docker login ghcr.io -u '$GHCR_USER' --password-stdin"
+          else
+            echo "GHCR_READ_TOKEN no configurado; se asume que las imágenes son públicas."
+          fi
+
+      - name: Desplegar y validar salud
+        env:
+          HOST: ${{ secrets.LIGHTSAIL_HOST }}
+          USER: ${{ secrets.LIGHTSAIL_USER }}
+          BACKEND_IMAGE: ${{ needs.publish-images.outputs.backend_image }}
+          FRONTEND_IMAGE: ${{ needs.publish-images.outputs.frontend_image }}
+          HEALTH_URL: ${{ secrets.PRODUCTION_URL }}/actuator/health
+        run: |
+          ssh -i ~/.ssh/lightsail "$USER@$HOST" \
+            "chmod +x /opt/elecciones/deploy.sh && \
+             /opt/elecciones/deploy.sh '$BACKEND_IMAGE' '$FRONTEND_IMAGE' '$HEALTH_URL'"
