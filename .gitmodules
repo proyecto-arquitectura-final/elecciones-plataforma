@@ -1,9 +1,12 @@
 [submodule "back"]
 	path = back
 	url = https://github.com/proyecto-arquitectura-final/back-elecciones.git
+	branch = main
 [submodule "commons"]
 	path = commons
 	url = https://github.com/proyecto-arquitectura-final/commons.git
+	branch = main
 [submodule "front"]
 	path = front
 	url = https://github.com/proyecto-arquitectura-final/front-elecciones.git
+	branch = main

@@ -30,6 +30,6 @@ chown -R "$TARGET_USER":"$TARGET_USER" /opt/elecciones
 cat <<MSG
 Docker quedó instalado.
 1. Cierra y abre la sesión SSH para aplicar el grupo docker.
-2. Copia deploy/compose.prod.yml, deploy/deploy.sh y deploy/.env.example a /opt/elecciones.
+2. Copia deploy/compose.prod.yml, deploy/deploy-component.sh y deploy/.env.example a /opt/elecciones.
 3. Renombra .env.example a .env y completa los valores.
 MSG

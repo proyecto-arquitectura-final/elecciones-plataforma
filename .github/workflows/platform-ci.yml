@@ -1,0 +1,55 @@
+name: Plataforma · validar infraestructura
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/**'
+      - 'deploy/**'
+      - 'Dockerfile.backend'
+      - 'docker-compose.yml'
+      - 'pom.xml'
+      - '.gitmodules'
+      - '.dockerignore'
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/**'
+      - 'deploy/**'
+      - 'Dockerfile.backend'
+      - 'docker-compose.yml'
+      - 'pom.xml'
+      - '.gitmodules'
+      - '.dockerignore'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar plataforma
+        uses: actions/checkout@v6
+
+      - name: Validar scripts Bash
+        run: |
+          bash -n deploy/bootstrap-lightsail.sh
+          bash -n deploy/deploy-component.sh
+          bash -n deploy/deploy.sh
+
+      - name: Validar Compose de producción
+        run: |
+          docker compose \
+            --env-file deploy/.env.example \
+            -f deploy/compose.prod.yml \
+            config --quiet
+
+      - name: Validar Compose local
+        run: docker compose -f docker-compose.yml config --quiet
+
+      - name: Validar submódulos esperados
+        run: |
+          grep -q 'path = back' .gitmodules
+          grep -q 'path = commons' .gitmodules
+          grep -q 'path = front' .gitmodules

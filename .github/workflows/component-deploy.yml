@@ -1,0 +1,460 @@
+name: Componente · construir y desplegar
+run-name: "${{ inputs.component }} · ${{ inputs.component_sha || 'main' }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      component:
+        description: Componente que se va a construir y desplegar
+        required: true
+        type: choice
+        options:
+          - all
+          - backend
+          - commons
+          - frontend
+      component_sha:
+        description: SHA exacto; vacío usa la rama main
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: elecciones-produccion
+  cancel-in-progress: false
+
+env:
+  OWNER: proyecto-arquitectura-final
+  PLATFORM_REPOSITORY: elecciones-plataforma
+  BACK_REPOSITORY: back-elecciones
+  COMMONS_REPOSITORY: commons
+  FRONT_REPOSITORY: front-elecciones
+  BACKEND_IMAGE_REPOSITORY: ghcr.io/proyecto-arquitectura-final/elecciones-backend
+  FRONTEND_IMAGE_REPOSITORY: ghcr.io/proyecto-arquitectura-final/elecciones-frontend
+
+jobs:
+  prepare:
+    name: Resolver versiones
+    runs-on: ubuntu-latest
+    outputs:
+      component: ${{ steps.resolve.outputs.component }}
+      back_sha: ${{ steps.resolve.outputs.back_sha }}
+      commons_sha: ${{ steps.resolve.outputs.commons_sha }}
+      front_sha: ${{ steps.resolve.outputs.front_sha }}
+      build_backend: ${{ steps.resolve.outputs.build_backend }}
+      build_frontend: ${{ steps.resolve.outputs.build_frontend }}
+    steps:
+      - name: Descargar plataforma
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Resolver SHA de cada repositorio
+        id: resolve
+        shell: bash
+        env:
+          MANUAL_COMPONENT: ${{ inputs.component }}
+          MANUAL_SHA: ${{ inputs.component_sha }}
+        run: |
+          set -Eeuo pipefail
+
+          component="${MANUAL_COMPONENT:-}"
+          requested_sha="${MANUAL_SHA:-}"
+
+          case "$component" in
+            all|backend|commons|frontend) ;;
+            *) echo "Componente inválido: $component" >&2; exit 2 ;;
+          esac
+
+          pinned_sha() {
+            local path="$1"
+            git ls-tree HEAD "$path" | awk 'NR == 1 {print $3}'
+          }
+
+          main_sha() {
+            local repository="$1"
+            git ls-remote "https://github.com/${OWNER}/${repository}.git" refs/heads/main | awk 'NR == 1 {print $1}'
+          }
+
+          valid_sha() {
+            [[ "$1" =~ ^[0-9a-fA-F]{40}$ ]]
+          }
+
+          back_sha="$(pinned_sha back || true)"
+          commons_sha="$(pinned_sha commons || true)"
+          front_sha="$(pinned_sha front || true)"
+
+          valid_sha "$back_sha" || back_sha="$(main_sha "$BACK_REPOSITORY")"
+          valid_sha "$commons_sha" || commons_sha="$(main_sha "$COMMONS_REPOSITORY")"
+          valid_sha "$front_sha" || front_sha="$(main_sha "$FRONT_REPOSITORY")"
+
+          case "$component" in
+            backend)
+              if valid_sha "$requested_sha"; then back_sha="$requested_sha"; else back_sha="$(main_sha "$BACK_REPOSITORY")"; fi
+              build_backend=true
+              build_frontend=false
+              ;;
+            commons)
+              if valid_sha "$requested_sha"; then commons_sha="$requested_sha"; else commons_sha="$(main_sha "$COMMONS_REPOSITORY")"; fi
+              build_backend=true
+              build_frontend=false
+              ;;
+            frontend)
+              if valid_sha "$requested_sha"; then front_sha="$requested_sha"; else front_sha="$(main_sha "$FRONT_REPOSITORY")"; fi
+              build_backend=false
+              build_frontend=true
+              ;;
+            all)
+              back_sha="$(main_sha "$BACK_REPOSITORY")"
+              commons_sha="$(main_sha "$COMMONS_REPOSITORY")"
+              front_sha="$(main_sha "$FRONT_REPOSITORY")"
+              build_backend=true
+              build_frontend=true
+              ;;
+          esac
+
+          for value in "$back_sha" "$commons_sha" "$front_sha"; do
+            valid_sha "$value" || { echo "No se pudo resolver un SHA válido" >&2; exit 3; }
+          done
+
+          {
+            echo "component=$component"
+            echo "back_sha=$back_sha"
+            echo "commons_sha=$commons_sha"
+            echo "front_sha=$front_sha"
+            echo "build_backend=$build_backend"
+            echo "build_frontend=$build_frontend"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Componente: $component"
+          echo "Back:      $back_sha"
+          echo "Commons:   $commons_sha"
+          echo "Front:     $front_sha"
+
+  build-backend:
+    name: Backend · pruebas, imagen y publicación
+    needs: prepare
+    if: ${{ needs.prepare.outputs.build_backend == 'true' }}
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - name: Descargar plataforma
+        uses: actions/checkout@v6
+
+      - name: Limpiar rutas de submódulos
+        run: rm -rf back commons front
+
+      - name: Descargar backend exacto
+        uses: actions/checkout@v6
+        with:
+          repository: proyecto-arquitectura-final/back-elecciones
+          ref: ${{ needs.prepare.outputs.back_sha }}
+          token: ${{ secrets.CROSS_REPO_READ_TOKEN || github.token }}
+          path: back
+          persist-credentials: false
+
+      - name: Descargar commons exacto
+        uses: actions/checkout@v6
+        with:
+          repository: proyecto-arquitectura-final/commons
+          ref: ${{ needs.prepare.outputs.commons_sha }}
+          token: ${{ secrets.CROSS_REPO_READ_TOKEN || github.token }}
+          path: commons
+          persist-credentials: false
+
+      - name: Configurar Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+          cache-dependency-path: |
+            pom.xml
+            back/pom.xml
+            commons/pom.xml
+
+      - name: Compilar y ejecutar pruebas
+        run: mvn -B -ntp -U -pl back -am clean verify
+
+      - name: Definir etiqueta de imagen
+        id: meta
+        shell: bash
+        env:
+          BACK_SHA: ${{ needs.prepare.outputs.back_sha }}
+          COMMONS_SHA: ${{ needs.prepare.outputs.commons_sha }}
+        run: |
+          image="${BACKEND_IMAGE_REPOSITORY}:back-${BACK_SHA:0:12}-commons-${COMMONS_SHA:0:12}"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+
+      - name: Iniciar sesión en GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configurar Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Construir y publicar backend
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.backend
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}
+            ${{ env.BACKEND_IMAGE_REPOSITORY }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.prepare.outputs.back_sha }}
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+
+  build-frontend:
+    name: Frontend · pruebas, imagen y publicación
+    needs: prepare
+    if: ${{ needs.prepare.outputs.build_frontend == 'true' }}
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - name: Descargar frontend exacto
+        uses: actions/checkout@v6
+        with:
+          repository: proyecto-arquitectura-final/front-elecciones
+          ref: ${{ needs.prepare.outputs.front_sha }}
+          token: ${{ secrets.CROSS_REPO_READ_TOKEN || github.token }}
+          path: front
+          persist-credentials: false
+
+      - name: Configurar Node 22
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: front/package-lock.json
+
+      - name: Instalar dependencias
+        working-directory: front
+        run: npm ci --no-audit --no-fund
+
+      - name: Ejecutar pruebas
+        working-directory: front
+        run: npm test -- --watch=false
+
+      - name: Compilar Angular para producción
+        working-directory: front
+        run: npm run build
+
+      - name: Definir etiqueta de imagen
+        id: meta
+        shell: bash
+        env:
+          FRONT_SHA: ${{ needs.prepare.outputs.front_sha }}
+        run: |
+          image="${FRONTEND_IMAGE_REPOSITORY}:sha-${FRONT_SHA:0:12}"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+
+      - name: Iniciar sesión en GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configurar Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Construir y publicar frontend
+        uses: docker/build-push-action@v7
+        with:
+          context: front
+          file: front/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}
+            ${{ env.FRONTEND_IMAGE_REPOSITORY }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.prepare.outputs.front_sha }}
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,mode=max,scope=frontend
+
+  deploy-backend:
+    name: Backend · desplegar en Lightsail
+    needs: [prepare, build-backend]
+    if: ${{ always() && needs.build-backend.result == 'success' }}
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Descargar archivos de despliegue
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: deploy
+
+      - name: Configurar SSH
+        env:
+          SSH_KEY: ${{ secrets.LIGHTSAIL_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.LIGHTSAIL_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/lightsail
+          chmod 600 ~/.ssh/lightsail
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Copiar configuración al servidor
+        env:
+          HOST: ${{ secrets.LIGHTSAIL_HOST }}
+          USER: ${{ secrets.LIGHTSAIL_USER }}
+        run: |
+          ssh -i ~/.ssh/lightsail "$USER@$HOST" 'mkdir -p /opt/elecciones'
+          scp -i ~/.ssh/lightsail \
+            deploy/compose.prod.yml \
+            deploy/deploy-component.sh \
+            "$USER@$HOST:/opt/elecciones/"
+
+      - name: Autenticar Lightsail en GHCR
+        env:
+          HOST: ${{ secrets.LIGHTSAIL_HOST }}
+          USER: ${{ secrets.LIGHTSAIL_USER }}
+          GHCR_USER: ${{ secrets.GHCR_USERNAME }}
+          GHCR_TOKEN: ${{ secrets.GHCR_READ_TOKEN }}
+        run: |
+          if [[ -n "$GHCR_TOKEN" ]]; then
+            printf '%s' "$GHCR_TOKEN" | ssh -i ~/.ssh/lightsail "$USER@$HOST" \
+              "docker login ghcr.io -u '$GHCR_USER' --password-stdin"
+          else
+            echo "Sin GHCR_READ_TOKEN: se asume que el paquete es público."
+          fi
+
+      - name: Desplegar únicamente backend
+        env:
+          HOST: ${{ secrets.LIGHTSAIL_HOST }}
+          USER: ${{ secrets.LIGHTSAIL_USER }}
+          IMAGE: ${{ needs.build-backend.outputs.image }}
+          PUBLIC_URL: ${{ secrets.PRODUCTION_URL }}
+        run: |
+          ssh -i ~/.ssh/lightsail "$USER@$HOST" \
+            "chmod +x /opt/elecciones/deploy-component.sh && \
+             /opt/elecciones/deploy-component.sh backend '$IMAGE' '$PUBLIC_URL'"
+
+  deploy-frontend:
+    name: Frontend · desplegar en Lightsail
+    needs: [prepare, build-frontend, deploy-backend]
+    if: >-
+      ${{ always() &&
+          needs.build-frontend.result == 'success' &&
+          (needs.deploy-backend.result == 'success' || needs.deploy-backend.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Descargar archivos de despliegue
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: deploy
+
+      - name: Configurar SSH
+        env:
+          SSH_KEY: ${{ secrets.LIGHTSAIL_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.LIGHTSAIL_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/lightsail
+          chmod 600 ~/.ssh/lightsail
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Copiar configuración al servidor
+        env:
+          HOST: ${{ secrets.LIGHTSAIL_HOST }}
+          USER: ${{ secrets.LIGHTSAIL_USER }}
+        run: |
+          ssh -i ~/.ssh/lightsail "$USER@$HOST" 'mkdir -p /opt/elecciones'
+          scp -i ~/.ssh/lightsail \
+            deploy/compose.prod.yml \
+            deploy/deploy-component.sh \
+            "$USER@$HOST:/opt/elecciones/"
+
+      - name: Autenticar Lightsail en GHCR
+        env:
+          HOST: ${{ secrets.LIGHTSAIL_HOST }}
+          USER: ${{ secrets.LIGHTSAIL_USER }}
+          GHCR_USER: ${{ secrets.GHCR_USERNAME }}
+          GHCR_TOKEN: ${{ secrets.GHCR_READ_TOKEN }}
+        run: |
+          if [[ -n "$GHCR_TOKEN" ]]; then
+            printf '%s' "$GHCR_TOKEN" | ssh -i ~/.ssh/lightsail "$USER@$HOST" \
+              "docker login ghcr.io -u '$GHCR_USER' --password-stdin"
+          else
+            echo "Sin GHCR_READ_TOKEN: se asume que el paquete es público."
+          fi
+
+      - name: Desplegar únicamente frontend
+        env:
+          HOST: ${{ secrets.LIGHTSAIL_HOST }}
+          USER: ${{ secrets.LIGHTSAIL_USER }}
+          IMAGE: ${{ needs.build-frontend.outputs.image }}
+          PUBLIC_URL: ${{ secrets.PRODUCTION_URL }}
+        run: |
+          ssh -i ~/.ssh/lightsail "$USER@$HOST" \
+            "chmod +x /opt/elecciones/deploy-component.sh && \
+             /opt/elecciones/deploy-component.sh frontend '$IMAGE' '$PUBLIC_URL'"
+
+  record-version:
+    name: Registrar SHA desplegado en submódulos
+    needs: [prepare, deploy-backend, deploy-frontend]
+    if: >-
+      ${{ always() &&
+          needs.prepare.result == 'success' &&
+          ((needs.prepare.outputs.component == 'backend' && needs.deploy-backend.result == 'success') ||
+           (needs.prepare.outputs.component == 'commons' && needs.deploy-backend.result == 'success') ||
+           (needs.prepare.outputs.component == 'frontend' && needs.deploy-frontend.result == 'success') ||
+           (needs.prepare.outputs.component == 'all' && needs.deploy-backend.result == 'success' && needs.deploy-frontend.result == 'success')) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar plataforma para actualizar gitlinks
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.PLATFORM_WRITE_TOKEN || github.token }}
+
+      - name: Actualizar referencias de submódulos
+        shell: bash
+        env:
+          COMPONENT: ${{ needs.prepare.outputs.component }}
+          BACK_SHA: ${{ needs.prepare.outputs.back_sha }}
+          COMMONS_SHA: ${{ needs.prepare.outputs.commons_sha }}
+          FRONT_SHA: ${{ needs.prepare.outputs.front_sha }}
+        run: |
+          set -Eeuo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git pull --rebase origin main
+
+          case "$COMPONENT" in
+            backend)  git update-index --add --cacheinfo 160000,"$BACK_SHA",back ;;
+            commons)  git update-index --add --cacheinfo 160000,"$COMMONS_SHA",commons ;;
+            frontend) git update-index --add --cacheinfo 160000,"$FRONT_SHA",front ;;
+            all)
+              git update-index --add --cacheinfo 160000,"$BACK_SHA",back
+              git update-index --add --cacheinfo 160000,"$COMMONS_SHA",commons
+              git update-index --add --cacheinfo 160000,"$FRONT_SHA",front
+              ;;
+          esac
+
+          if git diff --cached --quiet; then
+            echo "Las referencias ya estaban actualizadas."
+            exit 0
+          fi
+
+          git commit -m "chore: registrar despliegue de $COMPONENT [skip ci]"
+          if ! git push origin HEAD:main; then
+            echo "::warning::El despliegue terminó, pero no se pudo actualizar el gitlink. Revisa protección de main o PLATFORM_WRITE_TOKEN."
+          fi
