@@ -1,0 +1,9 @@
+[submodule "back"]
+	path = back
+	url = https://github.com/proyecto-arquitectura-final/back-elecciones.git
+[submodule "commons"]
+	path = commons
+	url = https://github.com/proyecto-arquitectura-final/commons.git
+[submodule "front"]
+	path = front
+	url = https://github.com/proyecto-arquitectura-final/front-elecciones.git
