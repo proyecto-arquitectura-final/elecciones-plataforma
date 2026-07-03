@@ -34,6 +34,9 @@ env:
   FRONT_REPOSITORY: front-elecciones
   BACKEND_IMAGE_REPOSITORY: ghcr.io/proyecto-arquitectura-final/elecciones-backend
   FRONTEND_IMAGE_REPOSITORY: ghcr.io/proyecto-arquitectura-final/elecciones-frontend
+  NODE_VERSION: '24.16.0'
+  NPM_VERSION: '11.17.0'
+  MOBILE_API_URL: 'https://elecciones-maf.online/api/v1'
 
 jobs:
   prepare:
@@ -216,12 +219,15 @@ jobs:
           cache-to: type=gha,mode=max,scope=backend
 
   build-frontend:
-    name: Frontend · pruebas, imagen y publicación
+    name: Frontend · pruebas, APK release, imagen y publicación
     needs: prepare
     if: ${{ needs.prepare.outputs.build_frontend == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    environment: production
     outputs:
       image: ${{ steps.meta.outputs.image }}
+      apk_sha256: ${{ steps.apk_meta.outputs.sha256 }}
+      apk_name: ${{ steps.apk_meta.outputs.name }}
     steps:
       - name: Descargar frontend exacto
         uses: actions/checkout@v6
@@ -232,12 +238,38 @@ jobs:
           path: front
           persist-credentials: false
 
-      - name: Configurar Node 22
+      - name: Verificar proyecto Android versionado
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -f front/android/gradlew || {
+            echo "::error::El directorio android/ no está versionado en el repositorio frontend. Ejecuta npx cap add android, conserva los ajustes de firma y sube android/ a Git.";
+            exit 2;
+          }
+          chmod +x front/android/gradlew
+
+      - name: Configurar Node y npm
         uses: actions/setup-node@v6
         with:
-          node-version: '22'
-          cache: npm
-          cache-dependency-path: front/package-lock.json
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+
+      - name: Fijar npm y registry público
+        shell: bash
+        working-directory: front
+        run: |
+          set -Eeuo pipefail
+          npm install --global "npm@${NPM_VERSION}"
+          hash -r
+          npm config set registry https://registry.npmjs.org/
+          echo "Node: $(node --version)"
+          echo "npm:  $(npm --version)"
+          echo "Registry: $(npm config get registry)"
+          test "$(npm --version)" = "${NPM_VERSION}"
+          if grep -Rqs "applied-caas-gateway" package-lock.json .npmrc 2>/dev/null; then
+            echo "::error::El frontend contiene referencias a un registry interno no accesible desde GitHub Actions."
+            exit 3
+          fi
 
       - name: Instalar dependencias
         working-directory: front
@@ -247,9 +279,93 @@ jobs:
         working-directory: front
         run: npm test -- --watch=false
 
-      - name: Compilar Angular para producción
+      - name: Configurar Java 21 y caché Gradle
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+          cache-dependency-path: |
+            front/android/*.gradle
+            front/android/**/*.gradle
+            front/android/gradle/wrapper/gradle-wrapper.properties
+
+      - name: Verificar Android SDK del runner
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -n "${ANDROID_HOME:-}" || { echo "ANDROID_HOME no está definido" >&2; exit 4; }
+          test -d "$ANDROID_HOME/platforms/android-36" || sdkmanager "platforms;android-36"
+          test -d "$ANDROID_HOME/build-tools/35.0.0" || sdkmanager "build-tools;35.0.0"
+          java -version
+          (cd front/android && ./gradlew -version)
+
+      - name: Restaurar keystore de firma
+        id: signing
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -Eeuo pipefail
+          test -n "$KEYSTORE_BASE64" || {
+            echo "::error::Falta el secret ANDROID_KEYSTORE_BASE64 en el environment production.";
+            exit 5;
+          }
+          signing_dir="$RUNNER_TEMP/android-signing"
+          keystore_path="$signing_dir/sistema-electoral-release.jks"
+          install -m 700 -d "$signing_dir"
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$keystore_path"
+          chmod 600 "$keystore_path"
+          test -s "$keystore_path"
+          echo "ANDROID_KEYSTORE_PATH=$keystore_path" >> "$GITHUB_ENV"
+
+      - name: Generar APK release firmado para producción
         working-directory: front
-        run: npm run build
+        env:
+          MOBILE_API_URL: ${{ env.MOBILE_API_URL }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_VERSION_CODE: ${{ github.run_number }}
+          ANDROID_VERSION_NAME: 1.0.${{ github.run_number }}
+        run: |
+          set -Eeuo pipefail
+          test -n "$ANDROID_KEYSTORE_PASSWORD"
+          test -n "$ANDROID_KEY_ALIAS"
+          test -n "$ANDROID_KEY_PASSWORD"
+          npm run android:release
+
+      - name: Validar firma y preparar metadatos del APK
+        id: apk_meta
+        shell: bash
+        working-directory: front
+        run: |
+          set -Eeuo pipefail
+          apk="public/downloads/sistema-electoral.apk"
+          test -s "$apk"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$apk"
+          sha256="$(sha256sum "$apk" | awk '{print $1}')"
+          size="$(stat -c '%s' "$apk")"
+          echo "name=sistema-electoral.apk" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
+          echo "APK SHA-256: $sha256"
+          echo "APK bytes: $size"
+
+      - name: Compilar web incluyendo el APK release
+        working-directory: front
+        run: |
+          set -Eeuo pipefail
+          npm run build:web
+          test -s dist/srs-front/browser/downloads/sistema-electoral.apk
+          cmp public/downloads/sistema-electoral.apk dist/srs-front/browser/downloads/sistema-electoral.apk
+
+      - name: Conservar APK como artefacto del workflow
+        uses: actions/upload-artifact@v4
+        with:
+          name: sistema-electoral-${{ needs.prepare.outputs.front_sha }}
+          path: front/public/downloads/sistema-electoral.apk
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Definir etiqueta de imagen
         id: meta
@@ -270,7 +386,7 @@ jobs:
       - name: Configurar Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Construir y publicar frontend
+      - name: Construir y publicar frontend con el APK embebido
         uses: docker/build-push-action@v7
         with:
           context: front
@@ -282,6 +398,7 @@ jobs:
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ needs.prepare.outputs.front_sha }}
+            co.edu.elecciones.apk.sha256=${{ steps.apk_meta.outputs.sha256 }}
           cache-from: type=gha,scope=frontend
           cache-to: type=gha,mode=max,scope=frontend
 
@@ -405,6 +522,35 @@ jobs:
           ssh -i ~/.ssh/lightsail "$USER@$HOST" \
             "chmod +x /opt/elecciones/deploy-component.sh && \
              /opt/elecciones/deploy-component.sh frontend '$IMAGE' '$PUBLIC_URL'"
+
+
+      - name: Verificar que producción sirve exactamente el APK generado
+        shell: bash
+        env:
+          PUBLIC_URL: ${{ secrets.PRODUCTION_URL }}
+          EXPECTED_SHA256: ${{ needs.build-frontend.outputs.apk_sha256 }}
+        run: |
+          set -Eeuo pipefail
+          apk_url="${PUBLIC_URL%/}/downloads/sistema-electoral.apk"
+          tmp_apk="$RUNNER_TEMP/sistema-electoral-production.apk"
+          for attempt in {1..12}; do
+            if curl --fail --silent --show-error --location \
+              --connect-timeout 10 --max-time 90 \
+              "$apk_url" --output "$tmp_apk"; then
+              actual_sha256="$(sha256sum "$tmp_apk" | awk '{print $1}')"
+              if [[ "$actual_sha256" == "$EXPECTED_SHA256" ]]; then
+                echo "APK productivo verificado: $apk_url"
+                echo "SHA-256: $actual_sha256"
+                exit 0
+              fi
+              echo "Intento $attempt: el servidor aún entrega el APK anterior ($actual_sha256)."
+            else
+              echo "Intento $attempt: el APK todavía no está disponible."
+            fi
+            sleep 10
+          done
+          echo "::error::El APK servido en producción no coincide con el generado por este workflow."
+          exit 6
 
   record-version:
     name: Registrar SHA desplegado en submódulos
